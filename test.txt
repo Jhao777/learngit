@@ -1,1 +1,168 @@
-try to push github
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pcap.h>
+#include <netinet/in.h>
+#include <netinet/if_ether.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <ifaddrs.h>
+
+#define HOSTNUM 254
+
+struct arp_packet {
+    struct ethhdr ed;
+    struct arphdr ah;
+    unsigned char sender_mac[6];
+    unsigned char sender_ip[4];
+    unsigned char target_mac[6];
+    unsigned char target_ip[4];
+};
+
+char* iptos(unsigned int ip)
+{
+    static char ips[4][16];
+    static int idx;
+    unsigned char *p;
+
+    p = (unsigned char *)&ip;
+    idx = (idx + 1) % 4;
+    snprintf(ips[idx], 16, "%d.%d.%d.%d", p[0], p[1], p[2], p[3]);
+    return ips[idx];
+}
+
+int sendARP(pcap_t *handle, const char *srcIP, const unsigned char *srcMAC, const char *dstIP)
+{
+    struct arp_packet ap;
+    struct sockaddr_ll sa;
+    int i, ret;
+
+    memset(&ap, 0, sizeof(ap));
+    memset(&sa, 0, sizeof(sa));
+
+    // Set Ethernet header
+    for (i = 0; i < 6; i++) {
+        ap.ed.h_dest[i] = 0xff;
+        ap.ed.h_source[i] = srcMAC[i];
+    }
+    ap.ed.h_proto = htons(ETH_P_ARP);
+
+    // Set ARP header
+    ap.ah.ar_hrd = htons(ARPHRD_ETHER);
+    ap.ah.ar_pro = htons(ETH_P_IP);
+    ap.ah.ar_hln = 6;
+    ap.ah.ar_pln = 4;
+    ap.ah.ar_op = htons(ARPOP_REQUEST);
+
+    // Set sender MAC address and IP address
+    memcpy(ap.sender_mac, srcMAC, 6);
+    inet_pton(AF_INET, srcIP, ap.sender_ip);
+
+    // Set target IP address
+    inet_pton(AF_INET, dstIP, ap.target_ip);
+
+    // Set socket address
+    sa.sll_family = AF_PACKET;
+    sa.sll_protocol = htons(ETH_P_ARP);
+    sa.sll_ifindex = if_nametoindex(pcap_get_device(handle));
+    memcpy(sa.sll_addr, srcMAC, 6);
+    sa.sll_halen = 6;
+
+    // Send ARP packet
+    ret = pcap_sendto(handle, (const u_char *)&ap, sizeof(ap));
+    if (ret == -1) {
+        fprintf(stderr, "Error sending ARP packet: %s\n", pcap_geterr(handle));
+        return 0;
+    }
+
+    return 1;
+}
+
+void receiveARP(pcap_t *handle, const unsigned char *srcMAC)
+{
+    struct pcap_pkthdr *header;
+    const u_char *packet;
+    struct arp_packet *ap;
+    int ret;
+
+    while ((ret = pcap_next_ex(handle, &header, &packet)) >= 0) {
+        if (ret == 0)
+            continue;
+
+        ap = (struct arp_packet *)(packet + sizeof(struct ethhdr));
+        if (ntohs(ap->ed.h_proto) == ETH_P_ARP &&
+            ntohs(ap->ah.ar_op) == ARPOP_REPLY &&
+            memcmp(ap->target_mac, srcMAC, 6) == 0) {
+            printf("ARP Reply received:\n");
+            printf("Sender MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   ap->sender_mac[0], ap->sender_mac[1], ap->sender_mac[2],
+                   ap->sender_mac[3], ap->sender_mac[4], ap->sender_mac[5]);
+            printf("Sender IP: %s\n", iptos(*(unsigned int *)ap->sender_ip));
+            break;
+        }
+    }
+
+    if (ret == -1) {
+        fprintf(stderr, "Error receiving ARP packet: %s\n", pcap_geterr(handle));
+    }
+}
+
+int main()
+{
+    pcap_t *handle;
+    struct ifaddrs *ifaddr, *ifa;
+    const unsigned char *srcMAC;
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int count = 0;
+
+    // Get network interfaces
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return 1;
+    }
+
+    // Find the first non-loopback interface with an IPv4 address
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+        if (!(ifa->ifa_flags & IFF_LOOPBACK) && ifa->ifa_addr->sa_family == AF_INET) {
+            handle = pcap_open_live(ifa->ifa_name, BUFSIZ, 1, 1000, NULL);
+            if (handle != NULL) {
+                srcMAC = (unsigned char *)ifa->ifa_data;
+                inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, srcIP, INET_ADDRSTRLEN);
+                break;
+            }
+        }
+    }
+
+    if (ifa == NULL) {
+        fprintf(stderr, "Error finding a suitable network interface.\n");
+        return 1;
+    }
+
+    printf("Source MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+           srcMAC[0], srcMAC[1], srcMAC[2], srcMAC[3], srcMAC[4], srcMAC[5]);
+    printf("Source IP: %s\n", srcIP);
+
+    printf("Enter the destination IP: ");
+    fgets(dstIP, sizeof(dstIP), stdin);
+    dstIP[strlen(dstIP) - 1] = '\0';  // Remove trailing newline
+
+    // Send ARP request
+    if (!sendARP(handle, srcIP, srcMAC, dstIP)) {
+        pcap_close(handle);
+        freeifaddrs(ifaddr);
+        return 1;
+    }
+
+    // Receive ARP reply
+    receiveARP(handle, srcMAC);
+
+    // Clean up
+    pcap_close(handle);
+    freeifaddrs(ifaddr);
+
+    return 0;
+}
