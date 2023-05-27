@@ -1,0 +1,168 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pcap.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#define ETH_ARP 0x0806
+#define ARP_HARDWARE 1
+#define ETH_IP 0x0800
+#define ARP_REQUEST 1
+#define ARP_REPLY 2
+#define IPTOSBUFFERS 12
+#define HOSTNUM 254
+
+struct arp_head {
+    unsigned short hardware_type;    // 硬件类型
+    unsigned short protocol_type;    // 协议类型
+    unsigned char hardware_add_len;  // 硬件地址长度
+    unsigned char protocol_add_len;  // 协议地址长度
+    unsigned short operation_field;  // 操作字段
+    unsigned char source_mac_add[6]; // 源mac地址
+    unsigned long source_ip_add;     // 源ip地址
+    unsigned char dest_mac_add[6];   // 目的mac地址
+    unsigned long dest_ip_add;       // 目的ip地址
+};
+
+struct ethernet_head {
+    unsigned char dest_mac_add[6];    // 目的mac地址
+    unsigned char source_mac_add[6];  // 源mac地址
+    unsigned short type;              // 帧类型
+};
+
+struct arp_packet {
+    struct ethernet_head ed;
+    struct arp_head ah;
+};
+
+// Function to convert IP address from numeric to string format
+char *iptos(u_long in) {
+    static char output[IPTOSBUFFERS][3*4+3+1];
+    static short which;
+    u_char *p;
+    p = (u_char *)&in;
+    which = (which + 1 == IPTOSBUFFERS ? 0 : which + 1);
+    snprintf(output[which], sizeof(output[which]), "%d.%d.%d.%d", p[0], p[1], p[2], p[3]);
+    return output[which];
+}
+
+// Send ARP packet to the network
+int sendARP(pcap_t *handle, const char *srcIP, const unsigned char *srcMAC, const char *dstIP) {
+    struct ethernet_head eh;
+    struct arp_head ah;
+    unsigned char sendbuf[42];
+
+    memset(eh.dest_mac_add, 0xff, 6); // Destination MAC address is set to broadcast address
+    memcpy(eh.source_mac_add, srcMAC, 6);
+    memset(ah.dest_mac_add, 0x00, 6); // Destination MAC address is initially set to zero
+
+    eh.type = htons(ETH_ARP);
+    ah.hardware_type = htons(ARP_HARDWARE);
+    ah.protocol_type = htons(ETH_IP);
+    ah.hardware_add_len = 6;
+    ah.protocol_add_len = 4;
+    ah.source_ip_add = inet_addr(srcIP);
+    ah.operation_field = htons(ARP_REQUEST);
+    ah.dest_ip_add = inet_addr(dstIP);
+
+    memset(sendbuf, 0, sizeof(sendbuf));
+    memcpy(sendbuf, &eh, sizeof(eh));
+    memcpy(sendbuf + sizeof(eh), &ah, sizeof(ah));
+
+    if (pcap_sendpacket(handle, sendbuf, 42) == 0) {
+        return 1; // Packet sent successfully
+    } else {
+        fprintf(stderr, "Failed to send ARP packet: %s\n", pcap_geterr(handle));
+        return 0;
+    }
+}
+
+// Receive and analyze incoming ARP packets
+void receiveARP(pcap_t *handle, const unsigned char *srcMAC) {
+    struct pcap_pkthdr *header;
+    const u_char *packet;
+    struct arp_packet *ap;
+    int ret;
+
+    while ((ret = pcap_next_ex(handle, &header, &packet)) >= 0) {
+        if (ret == 0)
+            continue;
+
+        ap = (struct arp_packet *)packet;
+        if (ntohs(ap->ed.type) == ETH_ARP &&
+            ntohs(ap->ah.operation_field) == ARP_REPLY &&
+            memcmp(ap->ah.source_mac_add, srcMAC, 6) == 0) {
+            printf("ARP Reply received: IP = %s, MAC = %.2X:%.2X:%.2X:%.2X:%.2X:%.2X\n",
+                iptos(ap->ah.source_ip_add),
+                ap->ah.source_mac_add[0], ap->ah.source_mac_add[1], ap->ah.source_mac_add[2],
+                ap->ah.source_mac_add[3], ap->ah.source_mac_add[4], ap->ah.source_mac_add[5]);
+        }
+    }
+
+    if (ret == -1) {
+        fprintf(stderr, "Error occurred while capturing ARP packets: %s\n", pcap_geterr(handle));
+    }
+}
+
+int main() {
+    pcap_t *handle;
+    char errbuf[PCAP_ERRBUF_SIZE];
+    struct pcap_pkthdr header;
+    const u_char *packet;
+    char *dev;
+    struct ifaddrs *ifaddr, *ifa;
+    unsigned char srcMAC[6];
+    char srcIP[INET_ADDRSTRLEN];
+
+    // Find a suitable network device
+    if (pcap_findalldevs(&ifaddr, errbuf) == -1) {
+        fprintf(stderr, "Error finding network devices: %s\n", errbuf);
+        return 1;
+    }
+
+    // Select the first available device
+    dev = ifaddr->ifa_name;
+
+    // Open the network device for capturing and sending packets
+    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    if (handle == NULL) {
+        fprintf(stderr, "Could not open device %s: %s\n", dev, errbuf);
+        return 1;
+    }
+
+    // Get the source MAC address and IP address
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        if (ifa->ifa_addr->sa_family == AF_PACKET && strcmp(ifa->ifa_name, dev) == 0) {
+            struct sockaddr_ll *s = (struct sockaddr_ll*)ifa->ifa_addr;
+            memcpy(srcMAC, s->sll_addr, 6);
+        }
+
+        if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, dev) == 0) {
+            struct sockaddr_in *s = (struct sockaddr_in*)ifa->ifa_addr;
+            inet_ntop(AF_INET, &(s->sin_addr), srcIP, INET_ADDRSTRLEN);
+        }
+    }
+
+    // Send ARP packets and receive replies
+    for (int i = 1; i <= HOSTNUM; i++) {
+        char dstIP[INET_ADDRSTRLEN];
+        snprintf(dstIP, sizeof(dstIP), "%s.%d", strtok(srcIP, "."), i);
+        if (sendARP(handle, srcIP, srcMAC, dstIP)) {
+            printf("ARP Request sent for IP: %s\n", dstIP);
+        }
+    }
+
+    // Receive and analyze incoming ARP packets
+    receiveARP(handle, srcMAC);
+
+    // Free the device list and close the capture handle
+    pcap_freealldevs(ifaddr);
+    pcap_close(handle);
+
+    return 0;
+}
+
